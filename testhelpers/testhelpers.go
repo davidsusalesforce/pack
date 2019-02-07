@@ -226,7 +226,7 @@ func CreateImageOnLocal(t *testing.T, dockerCli *docker.Client, repoName, docker
 	})
 	AssertNil(t, err)
 
-	io.Copy(ioutil.Discard, res.Body)
+	io.Copy(os.Stdout, res.Body)
 	res.Body.Close()
 }
 
