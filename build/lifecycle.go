@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/network"
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/pkg/errors"
 
 	"github.com/buildpack/pack/containers"
 	"github.com/buildpack/pack/logging"
@@ -30,10 +31,12 @@ type Phase struct {
 	ctrConf  *container.Config
 	hostConf *container.HostConfig
 	ctr      container.ContainerCreateCreatedBody
+	files    []io.Reader
 }
 
 type Docker interface {
 	RunContainer(ctx context.Context, id string, stdout io.Writer, stderr io.Writer) error
+	CopyToContainer(ctx context.Context, containerID, dstPath string, content io.Reader, options types.CopyToContainerOptions) error
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, containerName string) (container.ContainerCreateCreatedBody, error)
 	ContainerRemove(ctx context.Context, containerID string, options types.ContainerRemoveOptions) error
 }
@@ -60,6 +63,7 @@ func (l *Lifecycle) NewPhase(name string, ops ...func(*Phase) (*Phase, error)) (
 		context:  l.Context,
 		docker:   l.Docker,
 		logger:   l.Logger,
+		files:    []io.Reader{},
 	}
 	var err error
 	for _, op := range ops {
@@ -71,14 +75,14 @@ func (l *Lifecycle) NewPhase(name string, ops ...func(*Phase) (*Phase, error)) (
 	return step, nil
 }
 
-func (l *Lifecycle) WithArgs(args ...string) func(*Phase) (*Phase, error) {
+func WithArgs(args ...string) func(*Phase) (*Phase, error) {
 	return func(phase *Phase) (*Phase, error) {
 		phase.ctrConf.Cmd = append(phase.ctrConf.Cmd, args...)
 		return phase, nil
 	}
 }
 
-func (l *Lifecycle) WithDaemonAccess() func(*Phase) (*Phase, error) {
+func WithDaemonAccess() func(*Phase) (*Phase, error) {
 	return func(phase *Phase) (*Phase, error) {
 		phase.ctrConf.User = "root"
 		phase.hostConf.Binds = append(phase.hostConf.Binds, "/var/run/docker.sock:/var/run/docker.sock")
@@ -86,7 +90,7 @@ func (l *Lifecycle) WithDaemonAccess() func(*Phase) (*Phase, error) {
 	}
 }
 
-func (l *Lifecycle) WithRegistryAccess(repos ...string) func(*Phase) (*Phase, error) {
+func WithRegistryAccess(repos ...string) func(*Phase) (*Phase, error) {
 	return func(phase *Phase) (*Phase, error) {
 		authHeader, err := auth.BuildEnvVar(authn.DefaultKeychain, repos...)
 		if err != nil {
@@ -98,20 +102,32 @@ func (l *Lifecycle) WithRegistryAccess(repos ...string) func(*Phase) (*Phase, er
 	}
 }
 
-func (s *Phase) Run() error {
-	var err error
-	s.ctr, err = s.docker.ContainerCreate(s.context, s.ctrConf, s.hostConf, nil, "")
-	if err != nil {
-		return nil
+func WithFiles(reader io.Reader) func(*Phase) (*Phase, error) {
+	return func(phase *Phase) (*Phase, error) {
+		phase.files = append(phase.files, reader)
+		return phase, nil
 	}
-	return s.docker.RunContainer(
-		s.context,
-		s.ctr.ID,
-		s.logger.VerboseWriter().WithPrefix(s.name),
-		s.logger.VerboseErrorWriter().WithPrefix(s.name),
+}
+
+func (p *Phase) Run() error {
+	var err error
+	p.ctr, err = p.docker.ContainerCreate(p.context, p.ctrConf, p.hostConf, nil, "")
+	if err != nil {
+		return errors.Wrapf(err, "failed to create '%s' container", p.name)
+	}
+	for _, r := range p.files {
+		if err := p.docker.CopyToContainer(p.context, p.ctr.ID, "/", r, types.CopyToContainerOptions{}); err != nil {
+			return errors.Wrapf(err, "failed to copy files to '%s' container", p.name)
+		}
+	}
+	return p.docker.RunContainer(
+		p.context,
+		p.ctr.ID,
+		p.logger.VerboseWriter().WithPrefix(p.name),
+		p.logger.VerboseErrorWriter().WithPrefix(p.name),
 	)
 }
 
-func (s *Phase) Cleanup() error {
-	return containers.Remove(s.docker, s.ctr.ID)
+func (p *Phase) Cleanup() error {
+	return containers.Remove(p.docker, p.ctr.ID)
 }

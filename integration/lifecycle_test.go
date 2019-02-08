@@ -308,7 +308,7 @@ cache = false
 		})
 	}, spec.Sequential())
 
-	when("#Build", func() {
+	when.Focus("#Build", func() {
 		it.Before(func() {
 			var err error
 

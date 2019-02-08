@@ -3,7 +3,6 @@ package build_test
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"io/ioutil"
 	"math/rand"
@@ -83,7 +82,7 @@ func testLifecycle(t *testing.T, when spec.G, it spec.S) {
 			})
 
 			it("attaches the workspace volume to /workspace", func() {
-				phase, err := lifecycle.NewPhase("phase", lifecycle.WithArgs("workspace"))
+				phase, err := lifecycle.NewPhase("phase", build.WithArgs("workspace"))
 				h.AssertNil(t, err)
 				assertRunSucceeds(t, phase, &outBuf, &errBuf)
 				h.AssertContains(t, outBuf.String(), "[phase] workspace test")
@@ -93,7 +92,7 @@ func testLifecycle(t *testing.T, when spec.G, it spec.S) {
 
 			when("#WithArgs", func() {
 				it("runs the lifecycle phase with args", func() {
-					phase, err := lifecycle.NewPhase("phase", lifecycle.WithArgs("some", "args"))
+					phase, err := lifecycle.NewPhase("phase", build.WithArgs("some", "args"))
 					h.AssertNil(t, err)
 					assertRunSucceeds(t, phase, &outBuf, &errBuf)
 					h.AssertContains(t, outBuf.String(), `received args [/lifecycle/phase some args]`)
@@ -104,8 +103,8 @@ func testLifecycle(t *testing.T, when spec.G, it spec.S) {
 				it("allows daemon access inside the container", func() {
 					phase, err := lifecycle.NewPhase(
 						"phase",
-						lifecycle.WithArgs("daemon"),
-						lifecycle.WithDaemonAccess(),
+						build.WithArgs("daemon"),
+						build.WithDaemonAccess(),
 					)
 					h.AssertNil(t, err)
 					assertRunSucceeds(t, phase, &outBuf, &errBuf)
@@ -127,12 +126,27 @@ func testLifecycle(t *testing.T, when spec.G, it spec.S) {
 				it("provides auth for registry in the container", func() {
 					phase, err := lifecycle.NewPhase(
 						"phase",
-						lifecycle.WithArgs("registry", registry.RepoName("packs/build:v3alpha2")),
-						lifecycle.WithRegistryAccess(),
+						build.WithArgs("registry", registry.RepoName("packs/build:v3alpha2")),
+						build.WithRegistryAccess(),
 					)
 					h.AssertNil(t, err)
 					assertRunSucceeds(t, phase, &outBuf, &errBuf)
 					h.AssertContains(t, outBuf.String(), "[phase] registry test")
+				})
+			})
+
+			when("#WithFiles", func() {
+				it("copies the files into the container before running", func() {
+					reader, err := (&fs.FS{}).CreateSingleFileTar("dummy/file/location/in/container", "some contents")
+					h.AssertNil(t, err)
+					phase, err := lifecycle.NewPhase(
+						"phase",
+						build.WithArgs("files", "/dummy/file/location/in/container"),
+						build.WithFiles(reader),
+					)
+					h.AssertNil(t, err)
+					assertRunSucceeds(t, phase, &outBuf, &errBuf)
+					h.AssertContains(t, outBuf.String(), "[phase] file contents: some contents")
 				})
 			})
 		})

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"os"
 
 	"github.com/buildpack/lifecycle/image/auth"
@@ -22,6 +23,9 @@ func main() {
 	}
 	if len(os.Args) > 1 && os.Args[1] == "registry" {
 		testRegistryAccess(os.Args[2])
+	}
+	if len(os.Args) > 1 && os.Args[1] == "files" {
+		testFiles(os.Args[2])
 	}
 }
 
@@ -66,4 +70,14 @@ func testRegistryAccess(repoName string) {
 		fmt.Println("failed to access image")
 		os.Exit(6)
 	}
+}
+
+func testFiles(filename string) {
+	fmt.Println("files test")
+	contents, err := ioutil.ReadFile(filename)
+	if err != nil {
+		fmt.Printf("failed to read file '%s'\n", filename)
+		os.Exit(7)
+	}
+	fmt.Println("file contents:", string(contents))
 }

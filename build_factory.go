@@ -302,18 +302,26 @@ func Build(ctx context.Context, outWriter, errWriter io.Writer, appDir, buildIma
 }
 
 func (b *BuildConfig) Run(ctx context.Context) error {
+	lifecycle := &build.Lifecycle{
+		BuilderImage:    b.Builder,
+		WorkspaceVolume: b.Cache.Volume(),
+		Docker:          b.Cli,
+		Logger:          b.Logger,
+		Context:         ctx,
+	}
+
 	if err := b.Detect(ctx); err != nil {
 		return err
 	}
 
 	b.Logger.Verbose(style.Step("ANALYZING"))
 	b.Logger.Verbose("Reading information from previous image for possible re-use")
-	if err := b.Analyze(ctx); err != nil {
+	if err := b.Analyze(lifecycle); err != nil {
 		return err
 	}
 
 	b.Logger.Verbose(style.Step("BUILDING"))
-	if err := b.Build(ctx); err != nil {
+	if err := b.Build(lifecycle); err != nil {
 		return err
 	}
 
@@ -332,6 +340,41 @@ func (b *BuildConfig) parseBuildpack(ref string) (string, string) {
 	}
 	b.Logger.Verbose("No version for %s buildpack provided, will use %s", style.Symbol(parts[0]), style.Symbol(parts[0]+"@latest"))
 	return parts[0], "latest"
+}
+
+func (b *BuildConfig) getBuildpacks() ([]*lifecycle.Buildpack, io.Reader, error) {
+	var buildpacks []*lifecycle.Buildpack
+	r, w := io.Pipe()
+	defer w.Close()
+	for _, bp := range b.Buildpacks {
+		var id, version string
+		if _, err := os.Stat(filepath.Join(bp, "buildpack.toml")); !os.IsNotExist(err) {
+			if runtime.GOOS == "windows" {
+				return nil, nil, fmt.Errorf("directory buildpacks are not implemented on windows")
+			}
+			var buildpackTOML struct {
+				Buildpack Buildpack
+			}
+
+			_, err = toml.DecodeFile(filepath.Join(bp, "buildpack.toml"), &buildpackTOML)
+			if err != nil {
+				return nil, nil, fmt.Errorf(`failed to decode buildpack.toml from "%s": %s`, bp, err)
+			}
+			id = buildpackTOML.Buildpack.ID
+			version = buildpackTOML.Buildpack.Version
+			bpDir := filepath.Join(buildpacksDir, buildpackTOML.Buildpack.escapedID(), version)
+			if err := fs.WriteTarArchive(w, bp, bpDir, 0, 0); err != nil {
+				return nil, nil, errors.Wrapf(err, "adding buildpack '%s:%s'", id, version)
+			}
+		} else {
+			id, version = b.parseBuildpack(bp)
+		}
+		buildpacks = append(
+			buildpacks,
+			&lifecycle.Buildpack{ID: id, Version: version, Optional: false},
+		)
+	}
+	return buildpacks, r, nil
 }
 
 func (b *BuildConfig) copyBuildpacksToContainer(ctx context.Context, ctrID string) ([]*lifecycle.Buildpack, error) {
@@ -467,28 +510,20 @@ func (b *BuildConfig) Detect(ctx context.Context) error {
 	return nil
 }
 
-func (b *BuildConfig) Analyze(ctx context.Context) error {
-	lfcycle := &build.Lifecycle{
-		BuilderImage:    b.Builder,
-		WorkspaceVolume: b.Cache.Volume(),
-		Docker:          b.Cli,
-		Logger:          b.Logger,
-		Context:         ctx,
-	}
-
+func (b *BuildConfig) Analyze(lifecycle *build.Lifecycle) error {
 	var analyze *build.Phase
 	var err error
 	if b.Publish {
-		analyze, err = lfcycle.NewPhase(
+		analyze, err = lifecycle.NewPhase(
 			"analyzer",
-			lfcycle.WithRegistryAccess(b.RepoName, b.RunImage),
-			lfcycle.WithArgs("-layers", launchDir, "-group", groupPath, b.RepoName),
+			build.WithRegistryAccess(b.RepoName, b.RunImage),
+			build.WithArgs("-layers", launchDir, "-group", groupPath, b.RepoName),
 		)
 	} else {
-		analyze, err = lfcycle.NewPhase(
+		analyze, err = lifecycle.NewPhase(
 			"analyzer",
-			lfcycle.WithDaemonAccess(),
-			lfcycle.WithArgs("-layers", launchDir, "-group", groupPath, "-daemon", b.RepoName),
+			build.WithDaemonAccess(),
+			build.WithArgs("-layers", launchDir, "-group", groupPath, "-daemon", b.RepoName),
 		)
 	}
 	defer analyze.Cleanup()
@@ -496,58 +531,54 @@ func (b *BuildConfig) Analyze(ctx context.Context) error {
 		return err
 	}
 
-	uid, gid, err := b.packUidGid(ctx, b.Builder)
+	uid, gid, err := b.packUidGid(lifecycle.Context, b.Builder)
 	if err != nil {
 		return errors.Wrap(err, "get pack uid and gid")
 	}
-	if err := b.chownDir(ctx, launchDir, uid, gid); err != nil {
+	if err := b.chownDir(lifecycle.Context, launchDir, uid, gid); err != nil {
 		return errors.Wrap(err, "chown launch dir")
 	}
 
 	return nil
 }
 
-func (b *BuildConfig) Build(ctx context.Context) error {
-	ctr, err := b.Cli.ContainerCreate(ctx, &container.Config{
-		Image: b.Builder,
-		Cmd: []string{
-			"/lifecycle/builder",
+func (b *BuildConfig) Build(lifecycle *build.Lifecycle) error {
+	options := []func(*build.Phase) (*build.Phase, error){
+		build.WithArgs(
 			"-buildpacks", buildpacksDir,
 			"-layers", launchDir,
 			"-group", groupPath,
 			"-plan", planPath,
 			"-platform", platformDir,
-		},
-		Labels: map[string]string{"author": "pack"},
-	}, &container.HostConfig{
-		Binds: []string{
-			fmt.Sprintf("%s:%s:", b.Cache.Volume(), launchDir),
-		},
-	}, nil, "")
+		),
+	}
+	if len(b.EnvFile) > 0 {
+		platformEnvTar, err := b.tarEnvFile()
+		if err != nil {
+			return err
+		}
+		options = append(options, build.WithFiles(platformEnvTar))
+	}
+	if len(b.Buildpacks) > 0 {
+		_, buildpacksTar, err := b.getBuildpacks()
+		if err != nil {
+			return err
+		}
+		options = append(options, build.WithFiles(buildpacksTar))
+	}
+
+	buildPhase, err := lifecycle.NewPhase(
+		"builder",
+		options...,
+	)
 	if err != nil {
 		return errors.Wrap(err, "create build container")
 	}
-	defer containers.Remove(b.Cli, ctr.ID)
-
-	if len(b.Buildpacks) > 0 {
-		_, err = b.copyBuildpacksToContainer(ctx, ctr.ID)
-		if err != nil {
-			return errors.Wrap(err, "copy buildpacks to container")
-		}
-	}
-
-	if err := b.copyEnvsToContainer(ctx, ctr.ID); err != nil {
-		return err
-	}
-
-	if err = b.Cli.RunContainer(
-		ctx,
-		ctr.ID,
-		b.Logger.VerboseWriter().WithPrefix("builder"),
-		b.Logger.VerboseErrorWriter().WithPrefix("builder"),
-	); err != nil {
+	defer buildPhase.Cleanup()
+	if err := buildPhase.Run(); err != nil {
 		return errors.Wrap(err, "run build container")
 	}
+
 	return nil
 }
 

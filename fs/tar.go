@@ -20,7 +20,7 @@ func (*FS) CreateTarFile(tarFile, srcDir, tarDir string, uid, gid int) error {
 		return fmt.Errorf("create file for tar: %s", err)
 	}
 	defer fh.Close()
-	return writeTarArchive(fh, srcDir, tarDir, uid, gid)
+	return WriteTarArchive(fh, srcDir, tarDir, uid, gid)
 }
 
 func (*FS) CreateTarReader(srcDir, tarDir string, uid, gid int) (io.Reader, chan error) {
@@ -29,7 +29,7 @@ func (*FS) CreateTarReader(srcDir, tarDir string, uid, gid int) (io.Reader, chan
 
 	go func() {
 		defer w.Close()
-		err := writeTarArchive(w, srcDir, tarDir, uid, gid)
+		err := WriteTarArchive(w, srcDir, tarDir, uid, gid)
 		w.Close()
 		errChan <- err
 	}()
@@ -50,8 +50,7 @@ func (*FS) CreateSingleFileTar(path, txt string) (io.Reader, error) {
 	}
 	return bytes.NewReader(buf.Bytes()), nil
 }
-
-func writeTarArchive(w io.Writer, srcDir, tarDir string, uid, gid int) error {
+func WriteTarArchive(w io.Writer, srcDir, tarDir string, uid, gid int) error {
 	tw := tar.NewWriter(w)
 	defer tw.Close()
 
