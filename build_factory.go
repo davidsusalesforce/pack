@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/buildpack/pack/build"
 	"github.com/buildpack/pack/cache"
 	"github.com/buildpack/pack/config"
 	"github.com/buildpack/pack/containers"
@@ -467,55 +468,32 @@ func (b *BuildConfig) Detect(ctx context.Context) error {
 }
 
 func (b *BuildConfig) Analyze(ctx context.Context) error {
-	ctrConf := &container.Config{
-		Image:  b.Builder,
-		Labels: map[string]string{"author": "pack"},
-	}
-	hostConfig := &container.HostConfig{
-		Binds: []string{
-			fmt.Sprintf("%s:%s:", b.Cache.Volume(), launchDir),
-		},
+	lfcycle := &build.Lifecycle{
+		BuilderImage:    b.Builder,
+		WorkspaceVolume: b.Cache.Volume(),
+		Docker:          b.Cli,
+		Logger:          b.Logger,
+		Context:         ctx,
 	}
 
+	var analyze *build.Phase
+	var err error
 	if b.Publish {
-		authHeader, err := auth.BuildEnvVar(authn.DefaultKeychain, b.RepoName, b.RunImage)
-		if err != nil {
-			return err
-		}
-
-		ctrConf.Env = []string{fmt.Sprintf(`CNB_REGISTRY_AUTH=%s`, authHeader)}
-		ctrConf.Cmd = []string{
-			"/lifecycle/analyzer",
-			"-layers", launchDir,
-			"-group", groupPath,
-			b.RepoName,
-		}
-		hostConfig.NetworkMode = "host"
+		analyze, err = lfcycle.NewPhase(
+			"analyzer",
+			lfcycle.WithRegistryAccess(b.RepoName, b.RunImage),
+			lfcycle.WithArgs("-layers", launchDir, "-group", groupPath, b.RepoName),
+		)
 	} else {
-		ctrConf.Cmd = []string{
-			"/lifecycle/analyzer",
-			"-layers", launchDir,
-			"-group", groupPath,
-			"-daemon",
-			b.RepoName,
-		}
-		ctrConf.User = "root"
-		hostConfig.Binds = append(hostConfig.Binds, "/var/run/docker.sock:/var/run/docker.sock")
+		analyze, err = lfcycle.NewPhase(
+			"analyzer",
+			lfcycle.WithDaemonAccess(),
+			lfcycle.WithArgs("-layers", launchDir, "-group", groupPath, "-daemon", b.RepoName),
+		)
 	}
-
-	ctr, err := b.Cli.ContainerCreate(ctx, ctrConf, hostConfig, nil, "")
-	if err != nil {
-		return errors.Wrap(err, "create analyze container")
-	}
-	defer containers.Remove(b.Cli, ctr.ID)
-
-	if err := b.Cli.RunContainer(
-		ctx,
-		ctr.ID,
-		b.Logger.VerboseWriter().WithPrefix("analyzer"),
-		b.Logger.VerboseErrorWriter().WithPrefix("analyzer"),
-	); err != nil {
-		return errors.Wrap(err, "run analyze container")
+	defer analyze.Cleanup()
+	if err = analyze.Run(); err != nil {
+		return err
 	}
 
 	uid, gid, err := b.packUidGid(ctx, b.Builder)
